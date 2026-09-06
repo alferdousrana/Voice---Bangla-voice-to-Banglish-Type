@@ -1,0 +1,6 @@
+PySide6
+faster-whisper
+sounddevice
+numpy
+pynput
+pytest
