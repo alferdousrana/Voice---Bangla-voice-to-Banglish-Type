@@ -1,275 +1,120 @@
-# app/transliteration/converter.py
-
 import re
 
-from .dictionary import (
+from app.speech.corrector import BanglaCorrectionEngine
+from app.transliteration.dictionary import (
     CUSTOM_PHRASES,
     CUSTOM_WORDS,
     WORD_MAP,
 )
+from app.transliteration.dictionary_manager import DictionaryManager
+from app.transliteration.unknown_words import save_unknown_words
+from app.utils.text_normalize import normalize_bangla, normalize_dict_keys
 
 
-# ============================================================
-# TOKEN PATTERNS
-# ============================================================
+BANGLA = r"\u0980-\u09FF"
 
-BENGALI_WORD_PATTERN = r"[\u0980-\u09FF]+"
-
-TOKEN_PATTERN = (
-    r"[\u0980-\u09FF]+"
-    r"|[A-Za-z0-9]+"
-    r"|[^\w\s]"
-    r"|\s+"
+TOKEN_PATTERN = re.compile(
+    rf"[{BANGLA}]+|[A-Za-z0-9_]+|\s+|[^\w\s]",
+    re.UNICODE,
 )
 
+BANGLA_WORD = re.compile(rf"[{BANGLA}]+")
 
-# ============================================================
-# NORMALIZATION
-# ============================================================
+# ASR fragments like "খ", "জ", "ম" are not real words.
+MIN_UNKNOWN_LENGTH = 2
 
-def normalize_bangla(text: str) -> str:
-    """
-    Normalize common Bengali Unicode variants.
-    """
-
-    if not text:
-        return ""
-
-    replacements = {
-        "য়": "য়",
-    }
-
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-
-    return text.strip()
-
-
-# ============================================================
-# DICTIONARY LOOKUP
-# ============================================================
-
-def lookup_word(word: str):
-    """
-    Look up a Bengali word.
-
-    Priority:
-
-        1. CUSTOM_WORDS
-        2. WORD_MAP
-
-    Returns:
-        Banglish string if found
-        None if unknown
-    """
-
-    word = normalize_bangla(word)
-
-    # User's custom dictionary has highest priority.
-    if word in CUSTOM_WORDS:
-        return CUSTOM_WORDS[word]
-
-    # Common dictionary.
-    if word in WORD_MAP:
-        return WORD_MAP[word]
-
-    return None
-
-
-# ============================================================
-# CUSTOM PHRASES
-# ============================================================
-
-def apply_custom_phrases(text: str):
-    """
-    Replace known phrases before word-level conversion.
-
-    Longer phrases are matched first.
-    """
-
-    if not text:
-        return text, []
-
-    matched_phrases = []
-
-    phrases = sorted(
-        CUSTOM_PHRASES.items(),
-        key=lambda item: len(item[0]),
-        reverse=True,
-    )
-
-    for bangla_phrase, banglish_phrase in phrases:
-
-        if bangla_phrase in text:
-
-            text = text.replace(
-                bangla_phrase,
-                banglish_phrase,
-            )
-
-            matched_phrases.append(
-                bangla_phrase
-            )
-
-    return text, matched_phrases
-
-
-# ============================================================
-# MAIN CONVERTER
-# ============================================================
-
-def bangla_to_banglish(
-    text: str,
-    show_unknown=False,
-):
-    """
-    Convert Bengali text using dictionary only.
-
-    Unknown Bengali words are NOT transliterated.
-
-    Example:
-
-        আমি আজকে অফিসে যাব না
-
-    becomes:
-
-        ami ajke office e jabo na
-
-    Unknown words are reported separately.
-    """
-
-    if not text:
-        if show_unknown:
-            return "", []
-
-        return ""
-
-    text = normalize_bangla(text)
-
-    # --------------------------------------------------------
-    # Apply custom phrases first
-    # --------------------------------------------------------
-
-    text, matched_phrases = apply_custom_phrases(text)
-
-    # --------------------------------------------------------
-    # Tokenize
-    # --------------------------------------------------------
-
-    tokens = re.findall(
-        TOKEN_PATTERN,
-        text,
-        flags=re.UNICODE,
-    )
-
-    result = []
-    unknown_words = []
-
-    for token in tokens:
-
-        # ----------------------------------------------------
-        # Bengali word
-        # ----------------------------------------------------
-
-        if re.fullmatch(
-            BENGALI_WORD_PATTERN,
-            token,
-        ):
-
-            converted = lookup_word(token)
-
-            if converted is not None:
-
-                result.append(converted)
-
-            else:
-
-                # Do NOT use fallback transliteration.
-                result.append(
-                    f"[UNKNOWN:{token}]"
-                )
-
-                if token not in unknown_words:
-                    unknown_words.append(token)
-
-        # ----------------------------------------------------
-        # Whitespace
-        # ----------------------------------------------------
-
-        elif token.isspace():
-
-            result.append(token)
-
-        # ----------------------------------------------------
-        # English / numbers / punctuation
-        # ----------------------------------------------------
-
-        else:
-
-            result.append(token)
-
-    # --------------------------------------------------------
-    # Build output
-    # --------------------------------------------------------
-
-    output = "".join(result)
-
-    output = re.sub(
-        r"[ \t]+",
-        " ",
-        output,
-    )
-
-    output = output.strip()
-
-    # --------------------------------------------------------
-    # Console warning
-    # --------------------------------------------------------
-
-    if unknown_words:
-        print(
-            "⚠️ Unknown words: "
-            + ", ".join(unknown_words)
-        )
-
-    if show_unknown:
-        return output, unknown_words
-
-    return output
-
-
-# ============================================================
-# CLASS API
-# ============================================================
 
 class BanglishConverter:
-    """
-    Main Banglish converter.
+    def __init__(self, dictionary_manager=None):
+        self.dictionary_manager = dictionary_manager or DictionaryManager()
+        self.corrector = BanglaCorrectionEngine()
 
-    Example:
+        # Normalize built-in dictionaries once.
+        self.word_map = normalize_dict_keys(WORD_MAP)
+        self.custom_words = normalize_dict_keys(CUSTOM_WORDS)
+        self.custom_phrases = normalize_dict_keys(CUSTOM_PHRASES)
 
-        converter = BanglishConverter()
+    # -------------------------------------------------
 
-        text = converter.convert(
-            "আমি আজকে অফিসে যাব না"
+    def normalize_bangla(self, text):
+        return normalize_bangla(text)
+
+    def lookup_word(self, word):
+        word = normalize_bangla(word)
+
+        return (
+            self.dictionary_manager.get_word(word)
+            or self.custom_words.get(word)
+            or self.word_map.get(word)
         )
-    """
 
-    def convert(self, text: str) -> str:
-        return bangla_to_banglish(text)
+    def get_dictionary_words(self):
+        words = set(self.word_map)
+        words.update(self.custom_words)
+        words.update(self.dictionary_manager.get_all_words())
+        return words
 
-    def convert_with_unknowns(self, text: str):
-        """
-        Return both converted text and unknown words.
+    def apply_custom_phrases(self, text):
+        phrases = dict(self.custom_phrases)
+        phrases.update(self.dictionary_manager.get_all_phrases())
 
-        Example:
+        for bangla, banglish in sorted(
+            phrases.items(),
+            key=lambda item: len(item[0]),
+            reverse=True,
+        ):
+            # Whole-word match only (no replacing inside another word).
+            pattern = rf"(?<![{BANGLA}]){re.escape(bangla)}(?![{BANGLA}])"
+            text = re.sub(pattern, banglish, text)
 
-            result, unknowns = converter.convert_with_unknowns(
-                "আমি আজকে খুব অফিসে যাব"
-            )
-        """
+        return text
 
-        return bangla_to_banglish(
+    def tokenize(self, text):
+        return TOKEN_PATTERN.findall(text)
+
+    # -------------------------------------------------
+
+    def convert_with_unknowns(self, text):
+        text = normalize_bangla(text)
+
+        if not text:
+            return "", []
+
+        text = self.corrector.correct(
             text,
-            show_unknown=True,
+            dictionary_words=self.get_dictionary_words(),
         )
+
+        text = self.apply_custom_phrases(text)
+
+        output = []
+        unknown_words = []
+
+        for token in self.tokenize(text):
+            if not token:
+                continue
+
+            if BANGLA_WORD.fullmatch(token):
+                banglish = self.lookup_word(token)
+
+                if banglish:
+                    output.append(banglish)
+                else:
+                    output.append(f"[UNKNOWN:{token}]")
+                    unknown_words.append(token)
+            else:
+                output.append(token)
+
+        result = "".join(output)
+        result = re.sub(r"\s+([,.!?;:])", r"\1", result)
+
+        to_save = [w for w in unknown_words if len(w) >= MIN_UNKNOWN_LENGTH]
+
+        if to_save:
+            save_unknown_words(to_save)
+
+        return result, unknown_words
+
+    def convert(self, text):
+        result, _ = self.convert_with_unknowns(text)
+        return result

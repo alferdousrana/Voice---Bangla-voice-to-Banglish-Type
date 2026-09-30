@@ -1,196 +1,404 @@
-# app/main.py
+import sys
+import threading
+from collections import deque
 
 import numpy as np
 
+from PySide6.QtCore import QObject, Signal, Slot
+from PySide6.QtWidgets import QApplication
+
 from app.audio.stream_recorder import StreamingRecorder
-from app.speech.vad import SpeechActivityDetector
-from app.speech.fast_recognizer import FastBanglaRecognizer
-from app.transliteration.converter import BanglishConverter
+from app.config.settings import CHANNELS, SAMPLE_RATE, get_audio_device
+from app.gui.dictionary_window import DictionaryWindow
+from app.gui.microphone_window import MicrophoneWindow
 from app.input.injector import TextInjector
+from app.speech.hybrid_recognizer import get_recognizer
+from app.speech.vad import SpeechActivityDetector
+from app.transliteration.converter import BanglishConverter
 
 
-SAMPLE_RATE = 16000
-CHUNK_SIZE = 512
+# Audio kept from BEFORE the VAD says "speech started".
+# Without this the first consonant is cut off
+# ("চামচ" was heard as "জামচ").
+PRE_ROLL_SECONDS = 0.5
+
+MIN_UTTERANCE_SECONDS = 0.4
+MAX_UTTERANCE_SECONDS = 25.0
 
 
-class VoicePipeline:
-    def __init__(self):
-        print("=" * 70)
-        print("🎙️ VOICE — BANGLA TO BANGLISH")
-        print("=" * 70)
+class VoiceWorker(QObject):
+    status = Signal(str)
+    unknown_words = Signal(list)
+    error = Signal(str)
+    finished = Signal()
 
-        print("\n🧠 Initializing components...")
+    def __init__(self, device=None):
+        super().__init__()
 
-        self.recorder = StreamingRecorder(
-            sample_rate=SAMPLE_RATE,
-            channels=1,
-            device=2,
-            chunk_duration=CHUNK_SIZE / SAMPLE_RATE,
-        )
+        self.running = False
+        self.stop_requested = threading.Event()
 
-        self.vad = SpeechActivityDetector(
-            threshold=0.5,
-            min_silence_duration_ms=500,
-            speech_pad_ms=100,
-        )
+        if device is None:
+            device = get_audio_device()
 
-        self.recognizer = FastBanglaRecognizer()
+        self.device = device
 
-        self.converter = BanglishConverter()
+        self.recorder = None
+        self.vad = None
+        self.recognizer = None
+        self.converter = None
+        self.injector = None
 
-        self.injector = TextInjector(
-            typing_interval=0.005,
-        )
-
-        print("✅ Voice pipeline ready.")
-
+    @Slot()
     def run(self):
-        """
-        Start continuous microphone listening.
+        if self.running:
+            return
 
-        Speech is collected between VAD start/end events.
-        After speech ends:
-
-            Audio
-              ↓
-            FastConformer
-              ↓
-            Bangla
-              ↓
-            Banglish
-              ↓
-            Active cursor
-        """
+        self.stop_requested.clear()
+        self.running = True
 
         speech_buffer = []
 
-        in_speech = False
-
-        self.recorder.clear_queue()
-        self.vad.reset()
-
-        self.recorder.start()
-
-        print("\n" + "=" * 70)
-        print("🔴 LISTENING... Speak now")
-        print("Press Ctrl+C to stop.")
-        print("=" * 70)
-
         try:
-            while True:
-                chunk = self.recorder.get_chunk(timeout=1)
+            if self.stop_requested.is_set():
+                return
+
+            self.status.emit("🧠 Loading voice engine...")
+
+            self.vad = SpeechActivityDetector()
+
+            if self.stop_requested.is_set():
+                return
+
+            # Loaded once, reused on every Start Listening.
+            self.recognizer = get_recognizer()
+
+            if self.stop_requested.is_set():
+                return
+
+            self.converter = BanglishConverter()
+            self.injector = TextInjector(typing_interval=0.005)
+
+            self.recorder = StreamingRecorder(
+                sample_rate=SAMPLE_RATE,
+                channels=CHANNELS,
+                device=self.device,
+            )
+
+            if self.stop_requested.is_set():
+                return
+
+            self.recorder.start()
+
+            self.status.emit("🔴 LISTENING... Speak now")
+
+            pre_roll = deque()
+            pre_roll_samples = 0
+            max_pre_roll = int(PRE_ROLL_SECONDS * SAMPLE_RATE)
+            max_samples = int(MAX_UTTERANCE_SECONDS * SAMPLE_RATE)
+            buffered_samples = 0
+
+            while self.running and not self.stop_requested.is_set():
+
+                chunk = self.recorder.get_chunk(timeout=0.5)
 
                 if chunk is None:
                     continue
 
-                chunk = np.asarray(
-                    chunk,
-                    dtype=np.float32,
-                )
+                if not self.running or self.stop_requested.is_set():
+                    break
 
                 event = self.vad.process(chunk)
 
-                # ------------------------------------------------
-                # Speech START
-                # ------------------------------------------------
+                if event == "start":
+                    # Start the utterance with the audio just before it.
+                    speech_buffer = list(pre_roll)
+                    buffered_samples = pre_roll_samples
 
-                if event["event"] == "start":
-
-                    in_speech = True
-                    speech_buffer = []
-
-                    print("\n🟢 RECORDING...")
-
-                # ------------------------------------------------
-                # Collect speech
-                # ------------------------------------------------
-
-                if in_speech:
+                if self.vad.in_speech or event == "end":
                     speech_buffer.append(chunk)
+                    buffered_samples += len(chunk)
 
-                # ------------------------------------------------
-                # Speech END
-                # ------------------------------------------------
+                # Rolling pre-roll window.
+                pre_roll.append(chunk)
+                pre_roll_samples += len(chunk)
 
-                if event["event"] == "end":
+                while pre_roll and pre_roll_samples - len(pre_roll[0]) >= max_pre_roll:
+                    pre_roll_samples -= len(pre_roll.popleft())
 
-                    in_speech = False
+                # Very long speech: force a cut (Whisper limit is 30 s).
+                if self.vad.in_speech and buffered_samples >= max_samples:
+                    event = "end"
+
+                if event == "end":
 
                     if not speech_buffer:
+                        self.vad.reset()
                         continue
 
-                    audio = np.concatenate(
-                        speech_buffer
-                    )
+                    if not self.running or self.stop_requested.is_set():
+                        speech_buffer = []
+                        self.vad.reset()
+                        break
 
-                    duration = (
-                        len(audio) / SAMPLE_RATE
-                    )
+                    audio = np.concatenate(speech_buffer)
+                    speech_buffer = []
+                    buffered_samples = 0
 
-                    print(
-                        f"🔴 RECORDING END — "
-                        f"{duration:.2f} seconds"
-                    )
+                    # Don't let the tail of this sentence leak into the next.
+                    pre_roll.clear()
+                    pre_roll_samples = 0
 
-                    print("🟡 PROCESSING...")
-
-                    # --------------------------------------------
-                    # Speech → Bangla
-                    # --------------------------------------------
+                    if len(audio) < MIN_UTTERANCE_SECONDS * SAMPLE_RATE:
+                        self.vad.reset()
+                        continue
 
                     bangla_text = self.recognizer.transcribe(
                         audio,
-                        SAMPLE_RATE,
+                        sample_rate=SAMPLE_RATE,
                     )
+
+                    if not self.running or self.stop_requested.is_set():
+                        speech_buffer = []
+                        self.vad.reset()
+                        break
 
                     if not bangla_text:
-                        print("⚠️ No speech recognized.")
+                        speech_buffer = []
+                        self.vad.reset()
                         continue
 
-                    print(
-                        f"🇧🇩 Bangla: {bangla_text}"
+                    print(f"🇧🇩 ASR: {bangla_text}")
+
+                    banglish, unknown = (
+                        self.converter.convert_with_unknowns(
+                            bangla_text
+                        )
                     )
 
-                    # --------------------------------------------
-                    # Bangla → Banglish
-                    # --------------------------------------------
+                    if not self.running or self.stop_requested.is_set():
+                        speech_buffer = []
+                        self.vad.reset()
+                        break
 
-                    banglish_text = self.converter.convert(
-                        bangla_text
-                    )
+                    print(f"🔤 OUT: {banglish}")
 
-                    print(
-                        f"🔤 Banglish: {banglish_text}"
-                    )
+                    if unknown:
+                        self.unknown_words.emit(unknown)
 
-                    # --------------------------------------------
-                    # Banglish → Active Cursor
-                    # --------------------------------------------
-
-                    if banglish_text:
-
+                    if (
+                        banglish
+                        and self.running
+                        and not self.stop_requested.is_set()
+                    ):
                         self.injector.type_text(
-                            banglish_text + " "
+                            banglish + " "
                         )
 
-                        print("⌨️ Typed into active cursor.")
+                    speech_buffer = []
+                    self.vad.reset()
 
-                    print("\n🔴 LISTENING...")
+            self.status.emit("⚪ LISTENING STOPPED")
 
-        except KeyboardInterrupt:
-
-            print("\n\n🛑 Stopping Voice...")
+        except Exception as exc:
+            if not self.stop_requested.is_set():
+                print(f"❌ Voice worker error: {exc}")
+                self.error.emit(str(exc))
 
         finally:
+            self.running = False
 
-            self.recorder.stop()
+            if self.recorder is not None:
+                try:
+                    self.recorder.stop()
+                except Exception:
+                    pass
 
-            print("✅ Voice stopped.")
+            if self.vad is not None:
+                try:
+                    self.vad.reset()
+                except Exception:
+                    pass
+
+            self.finished.emit()
+
+    def stop(self):
+        self.stop_requested.set()
+        self.running = False
+
+        if self.recorder is not None:
+            try:
+                self.recorder.stop()
+            except Exception:
+                pass
+
+
+class VoiceApp(QObject):
+    """
+    QObject, so worker signals (emitted from a background thread)
+    are delivered on the GUI thread. Touching widgets from another
+    thread can crash Qt randomly.
+    """
+
+    def __init__(self, app):
+        super().__init__()
+
+        self.app = app
+
+        self.microphone_window = None
+        self.dictionary_window = None
+
+        self.worker = None
+        self.thread = None
+
+        self.show_microphone_selection()
+
+    def show_microphone_selection(self):
+        self.microphone_window = MicrophoneWindow()
+
+        self.microphone_window.start_requested.connect(
+            self.start_voice
+        )
+
+        self.microphone_window.show()
+
+    @Slot(int)
+    def start_voice(self, device):
+        if self.worker is not None and self.worker.running:
+            return
+
+        print("🎙️ Starting Voice")
+
+        if self.microphone_window:
+            self.microphone_window.close()
+            self.microphone_window.deleteLater()
+            self.microphone_window = None
+
+        if self.dictionary_window is None:
+            self.dictionary_window = DictionaryWindow()
+
+            self.dictionary_window.start_listening_requested.connect(
+                self.start_listening
+            )
+
+            self.dictionary_window.stop_listening_requested.connect(
+                self.stop_listening
+            )
+
+            self.dictionary_window.window_closed.connect(
+                self.stop_voice
+            )
+
+            self.dictionary_window.show()
+
+        self.start_listening()
+
+    @Slot()
+    def start_listening(self):
+        if self.worker is not None:
+            if self.worker.running:
+                return
+
+            if self.thread is not None and self.thread.is_alive():
+                # Previous run is still finishing a transcription.
+                if self.dictionary_window:
+                    self.dictionary_window.set_listening_state(False)
+                    self.dictionary_window.status_label.setText(
+                        "⏳ Finishing last sentence... try again in a moment"
+                    )
+                return
+
+        device = get_audio_device()
+
+        self.worker = VoiceWorker(device=device)
+
+        self.worker.status.connect(
+            self.handle_status
+        )
+
+        self.worker.unknown_words.connect(
+            self.handle_unknown_words
+        )
+
+        self.worker.error.connect(
+            self.handle_error
+        )
+
+        self.worker.finished.connect(
+            self.handle_finished
+        )
+
+        self.thread = threading.Thread(
+            target=self.worker.run,
+            daemon=True,
+        )
+
+        self.thread.start()
+
+        if self.dictionary_window:
+            self.dictionary_window.set_listening_state(True)
+
+    @Slot()
+    def stop_listening(self):
+        if self.worker is None:
+            return
+
+        self.worker.stop()
+
+        if self.dictionary_window:
+            self.dictionary_window.set_listening_state(False)
+            self.dictionary_window.status_label.setText(
+                "⚪ LISTENING STOPPED"
+            )
+
+    @Slot()
+    def stop_voice(self):
+        if self.worker is not None:
+            self.worker.stop()
+
+    @Slot(str)
+    def handle_status(self, message):
+        if self.dictionary_window:
+            self.dictionary_window.status_label.setText(
+                message
+            )
+
+    @Slot(list)
+    def handle_unknown_words(self, words):
+        if self.dictionary_window:
+            self.dictionary_window.refresh_unknown_words()
+
+    @Slot(str)
+    def handle_error(self, message):
+        print(f"❌ Voice error: {message}")
+
+        if self.dictionary_window:
+            self.dictionary_window.status_label.setText(
+                f"❌ Error: {message}"
+            )
+            self.dictionary_window.set_listening_state(False)
+
+    @Slot()
+    def handle_finished(self):
+        if self.dictionary_window:
+            self.dictionary_window.set_listening_state(False)
+
+            if self.dictionary_window.isVisible():
+                self.dictionary_window.status_label.setText(
+                    "⚪ LISTENING STOPPED"
+                )
+
+        self.worker = None
+        self.thread = None
+
+    def run(self):
+        return self.app.exec()
 
 
 def main():
-    pipeline = VoicePipeline()
-    pipeline.run()
+    app = QApplication(sys.argv)
+    voice_app = VoiceApp(app)
+    sys.exit(voice_app.run())
 
 
 if __name__ == "__main__":
