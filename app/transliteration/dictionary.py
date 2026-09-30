@@ -168,6 +168,19 @@ WORD_MAP = {
     "রিয়েক্ট": "react",
     "গিটহাব": "github",
 
+    # Food / daily life
+    "চামচ": "chamoch",
+    "দিয়ে": "diye",
+    "ভাত": "bhat",
+    "খাই": "khai",
+    "খাও": "khao",
+    "খাব": "khabo",
+    "খাবো": "khabo",
+    "খেয়ে": "kheye",
+    "খেয়েছি": "kheyechi",
+    "যা": "ja",
+    "পানি": "pani",
+
     # Other
     "ভেঙে": "venge",
     "ভেঙ্গে": "venge",
