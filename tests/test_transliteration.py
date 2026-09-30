@@ -93,30 +93,30 @@ def test_punctuation():
 
 
 def test_unknown_word():
-    text = "আমি আজকে খুব অফিসে যাব"
+    text = "আমি আজকে ঝুমুরফাল অফিসে যাব"
 
     result = converter.convert(text)
 
     assert result == (
-        "ami ajke [UNKNOWN:খুব] office e jabo"
+        "ami ajke [UNKNOWN:ঝুমুরফাল] office e jabo"
     )
 
 
 def test_unknown_word_detection():
-    text = "আমি আজকে খুব সুন্দর অফিসে যাব"
+    text = "আমি আজকে ঝুমুরফাল সুন্দরিকাল অফিসে যাব"
 
     result, unknown_words = (
         converter.convert_with_unknowns(text)
     )
 
     assert result == (
-        "ami ajke [UNKNOWN:খুব] "
-        "[UNKNOWN:সুন্দর] office e jabo"
+        "ami ajke [UNKNOWN:ঝুমুরফাল] "
+        "[UNKNOWN:সুন্দরিকাল] office e jabo"
     )
 
     assert unknown_words == [
-        "খুব",
-        "সুন্দর",
+        "ঝুমুরফাল",
+        "সুন্দরিকাল",
     ]
 
 

@@ -10,7 +10,6 @@ __pycache__/
 .env
 
 # IDE
-.vscode/
 .idea/
 
 # Build
@@ -30,3 +29,7 @@ Thumbs.db
 
 # Debug audio
 debug_audio.wav
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
+.gitignore
